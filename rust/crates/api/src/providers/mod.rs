@@ -182,7 +182,10 @@ mod tests {
         );
         assert_eq!(detect_provider_kind("gpt-5.4"), ProviderKind::OpenAi);
         assert_eq!(detect_provider_kind("o3"), ProviderKind::OpenAi);
-        assert_eq!(detect_provider_kind("codex-mini-latest"), ProviderKind::OpenAi);
+        assert_eq!(
+            detect_provider_kind("codex-mini-latest"),
+            ProviderKind::OpenAi
+        );
     }
 
     #[test]

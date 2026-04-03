@@ -1112,10 +1112,7 @@ mod tests {
         std::env::split_paths(&path)
             .flat_map(|dir| candidate_python_paths(&dir))
             .find(|candidate| {
-                candidate.is_file()
-                    && !candidate
-                        .to_string_lossy()
-                        .contains("WindowsApps")
+                candidate.is_file() && !candidate.to_string_lossy().contains("WindowsApps")
             })
             .map(|candidate| candidate.to_string_lossy().into_owned())
     }

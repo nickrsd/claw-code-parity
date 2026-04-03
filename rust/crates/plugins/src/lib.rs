@@ -26,10 +26,7 @@ fn find_windows_posix_shell() -> Option<PathBuf> {
     std::env::split_paths(&path)
         .flat_map(|dir| candidate_windows_posix_shells(&dir))
         .find(|candidate| {
-            candidate.is_file()
-                && !candidate
-                    .to_string_lossy()
-                    .contains("WindowsApps")
+            candidate.is_file() && !candidate.to_string_lossy().contains("WindowsApps")
         })
 }
 

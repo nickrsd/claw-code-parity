@@ -191,7 +191,10 @@ impl McpToolRegistry {
                         let mut manager = manager
                             .lock()
                             .map_err(|_| "mcp server manager lock poisoned".to_string())?;
-                        manager.discover_tools().await.map_err(|error| error.to_string())?;
+                        manager
+                            .discover_tools()
+                            .await
+                            .map_err(|error| error.to_string())?;
                         let response = manager
                             .call_tool(&qualified_tool_name, arguments)
                             .await
@@ -360,10 +363,7 @@ mod tests {
         std::env::split_paths(&path)
             .flat_map(|dir| candidate_python_paths(&dir))
             .find(|candidate| {
-                candidate.is_file()
-                    && !candidate
-                        .to_string_lossy()
-                        .contains("WindowsApps")
+                candidate.is_file() && !candidate.to_string_lossy().contains("WindowsApps")
             })
             .map(|candidate| candidate.to_string_lossy().into_owned())
     }
@@ -882,7 +882,9 @@ mod tests {
             None,
         );
         registry
-            .set_manager(Arc::new(Mutex::new(McpServerManager::from_servers(&servers))))
+            .set_manager(Arc::new(Mutex::new(McpServerManager::from_servers(
+                &servers,
+            ))))
             .expect("manager should only be set once");
 
         let result = registry

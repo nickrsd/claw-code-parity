@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -127,7 +128,10 @@ impl GlobalToolRegistry {
             }
         }
 
-        Ok(Self { plugin_tools, enforcer: None })
+        Ok(Self {
+            plugin_tools,
+            enforcer: None,
+        })
     }
 
     #[must_use]
@@ -2798,7 +2802,10 @@ struct SubagentToolExecutor {
 
 impl SubagentToolExecutor {
     fn new(allowed_tools: BTreeSet<String>) -> Self {
-        Self { allowed_tools, enforcer: None }
+        Self {
+            allowed_tools,
+            enforcer: None,
+        }
     }
 
     fn with_enforcer(mut self, enforcer: PermissionEnforcer) -> Self {
@@ -2817,8 +2824,7 @@ impl ToolExecutor for SubagentToolExecutor {
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
         if let Some(enforcer) = &self.enforcer {
-            enforce_permission_check(enforcer, tool_name, &value)
-                .map_err(ToolError::new)?;
+            enforce_permission_check(enforcer, tool_name, &value).map_err(ToolError::new)?;
         }
         execute_tool(tool_name, &value).map_err(ToolError::new)
     }
@@ -3594,7 +3600,7 @@ fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
     }
     let runtime = resolve_repl_runtime(&input.language)?;
     let started = Instant::now();
-    let mut process = Command::new(runtime.program);
+    let mut process = Command::new(&runtime.program);
     process
         .args(runtime.args)
         .arg(&input.code)
@@ -3643,7 +3649,7 @@ fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
 }
 
 struct ReplRuntime {
-    program: &'static str,
+    program: PathBuf,
     args: &'static [&'static str],
 }
 
@@ -3668,11 +3674,8 @@ fn resolve_repl_runtime(language: &str) -> Result<ReplRuntime, String> {
     }
 }
 
-fn detect_first_command(commands: &[&'static str]) -> Option<&'static str> {
-    commands
-        .iter()
-        .copied()
-        .find(|command| command_exists(command))
+fn detect_first_command(commands: &[&str]) -> Option<PathBuf> {
+    commands.iter().find_map(|command| command_path(command))
 }
 
 #[derive(Clone, Copy)]
@@ -3986,18 +3989,18 @@ fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCo
     let _ = &input.description;
     let shell = detect_powershell_shell()?;
     execute_shell_command(
-        shell,
+        &shell,
         &input.command,
         input.timeout,
         input.run_in_background,
     )
 }
 
-fn detect_powershell_shell() -> std::io::Result<&'static str> {
-    if command_exists("pwsh") {
-        Ok("pwsh")
-    } else if command_exists("powershell") {
-        Ok("powershell")
+fn detect_powershell_shell() -> std::io::Result<PathBuf> {
+    if let Some(path) = command_path("pwsh") {
+        Ok(path)
+    } else if let Some(path) = command_path("powershell") {
+        Ok(path)
     } else {
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -4006,18 +4009,55 @@ fn detect_powershell_shell() -> std::io::Result<&'static str> {
     }
 }
 
-fn command_exists(command: &str) -> bool {
-    std::process::Command::new("sh")
-        .arg("-lc")
-        .arg(format!("command -v {command} >/dev/null 2>&1"))
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+fn command_path(command: &str) -> Option<PathBuf> {
+    let command_path = Path::new(command);
+    if command_path.is_absolute() || command.contains('/') || command.contains('\\') {
+        return command_path.is_file().then(|| command_path.to_path_buf());
+    }
+
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .flat_map(|dir| command_candidates(&dir, command))
+        .find(|candidate| candidate.is_file() && !is_windows_app_alias(candidate))
+}
+
+#[cfg(windows)]
+fn command_candidates(dir: &Path, command: &str) -> Vec<PathBuf> {
+    let mut candidates = vec![dir.join(command)];
+    if Path::new(command).extension().is_some() {
+        return candidates;
+    }
+
+    let pathext =
+        std::env::var_os("PATHEXT").unwrap_or_else(|| OsString::from(".COM;.EXE;.BAT;.CMD"));
+    candidates.extend(
+        pathext
+            .to_string_lossy()
+            .split(';')
+            .filter(|ext| !ext.is_empty())
+            .map(|ext| dir.join(format!("{command}{ext}"))),
+    );
+    candidates
+}
+
+#[cfg(not(windows))]
+fn command_candidates(dir: &Path, command: &str) -> Vec<PathBuf> {
+    vec![dir.join(command)]
+}
+
+#[cfg(windows)]
+fn is_windows_app_alias(path: &Path) -> bool {
+    path.to_string_lossy().contains("WindowsApps")
+}
+
+#[cfg(not(windows))]
+fn is_windows_app_alias(_path: &Path) -> bool {
+    false
 }
 
 #[allow(clippy::too_many_lines)]
 fn execute_shell_command(
-    shell: &str,
+    shell: &Path,
     command: &str,
     timeout: Option<u64>,
     run_in_background: Option<bool>,
@@ -4211,7 +4251,7 @@ mod tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
     use std::time::Duration;
@@ -4219,8 +4259,8 @@ mod tests {
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, execute_agent_with_spawn,
         execute_tool, final_assistant_text, mvp_tool_specs, permission_mode_from_plugin,
-        persist_agent_terminal_state, push_output_block, AgentInput, AgentJob,
-        GlobalToolRegistry, SubagentToolExecutor,
+        persist_agent_terminal_state, push_output_block, AgentInput, AgentJob, GlobalToolRegistry,
+        SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use runtime::{
@@ -4235,18 +4275,23 @@ mod tests {
     }
 
     fn temp_path(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time")
             .as_nanos();
-        std::env::temp_dir().join(format!("clawd-tools-{unique}-{name}"))
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("clawd-tools-{unique}-{counter}-{name}"))
     }
 
     fn permission_policy_for_mode(mode: PermissionMode) -> PermissionPolicy {
-        mvp_tool_specs().into_iter().fold(
-            PermissionPolicy::new(mode),
-            |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
-        )
+        mvp_tool_specs()
+            .into_iter()
+            .fold(PermissionPolicy::new(mode), |policy, spec| {
+                policy.with_tool_requirement(spec.name, spec.required_permission)
+            })
     }
 
     #[test]
@@ -4321,7 +4366,9 @@ mod tests {
             .expect_err("subagent write tool should be denied before dispatch");
 
         // then
-        assert!(error.to_string().contains("requires workspace-write permission"));
+        assert!(error
+            .to_string()
+            .contains("requires workspace-write permission"));
     }
 
     #[test]
@@ -4663,7 +4710,9 @@ mod tests {
 
     #[test]
     fn skill_loads_local_skill_prompt() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = temp_path("skills-home");
         let skill_dir = home.join(".agents").join("skills").join("help");
         fs::create_dir_all(&skill_dir).expect("skill dir should exist");
@@ -4686,10 +4735,8 @@ mod tests {
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
         assert_eq!(output["skill"], "help");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("/help/SKILL.md"));
+        assert!(Path::new(output["path"].as_str().expect("path"))
+            .ends_with(Path::new("help").join("SKILL.md")));
         assert!(output["prompt"]
             .as_str()
             .expect("prompt")
@@ -4705,10 +4752,8 @@ mod tests {
         let dollar_output: serde_json::Value =
             serde_json::from_str(&dollar_result).expect("valid json");
         assert_eq!(dollar_output["skill"], "$help");
-        assert!(dollar_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("/help/SKILL.md"));
+        assert!(Path::new(dollar_output["path"].as_str().expect("path"))
+            .ends_with(Path::new("help").join("SKILL.md")));
 
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
@@ -5333,10 +5378,10 @@ mod tests {
             .expect("glob should succeed");
         let globbed_output: serde_json::Value = serde_json::from_str(&globbed).expect("json");
         assert_eq!(globbed_output["numFiles"], 1);
-        assert!(globbed_output["filenames"][0]
-            .as_str()
-            .expect("filename")
-            .ends_with("nested/lib.rs"));
+        assert!(
+            Path::new(globbed_output["filenames"][0].as_str().expect("filename"))
+                .ends_with(Path::new("nested").join("lib.rs"))
+        );
 
         let glob_error = execute_tool("glob_search", &json!({ "pattern": "[" }))
             .expect_err("invalid glob should fail");
@@ -5661,6 +5706,9 @@ mod tests {
 
     #[test]
     fn repl_executes_python_code() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = execute_tool(
             "REPL",
             &json!({"language": "python", "code": "print(1 + 1)", "timeout_ms": 500}),
@@ -5674,6 +5722,9 @@ mod tests {
 
     #[test]
     fn given_empty_code_when_repl_then_rejects_with_error() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = execute_tool("REPL", &json!({"language": "python", "code": "   "}));
 
         let error = result.expect_err("empty REPL code should fail");
@@ -5682,6 +5733,9 @@ mod tests {
 
     #[test]
     fn given_unsupported_language_when_repl_then_rejects_with_error() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = execute_tool("REPL", &json!({"language": "ruby", "code": "puts 1"}));
 
         let error = result.expect_err("unsupported REPL language should fail");
@@ -5690,6 +5744,9 @@ mod tests {
 
     #[test]
     fn given_timeout_ms_when_repl_blocks_then_returns_timeout_error() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = execute_tool(
             "REPL",
             &json!({
@@ -5708,31 +5765,41 @@ mod tests {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dir = std::env::temp_dir().join(format!(
-            "clawd-pwsh-bin-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
+        let dir = temp_path("pwsh-bin");
         std::fs::create_dir_all(&dir).expect("create dir");
+        #[cfg(windows)]
+        let script = dir.join("pwsh.cmd");
+        #[cfg(not(windows))]
         let script = dir.join("pwsh");
+
+        #[cfg(windows)]
         std::fs::write(
             &script,
-            r#"#!/bin/sh
-while [ "$1" != "-Command" ] && [ $# -gt 0 ]; do shift; done
-shift
-printf 'pwsh:%s' "$1"
-"#,
+            "@echo off\r\nsetlocal\r\n:loop\r\nif \"%~1\"==\"\" goto done\r\nif /I \"%~1\"==\"-Command\" goto found\r\nshift\r\ngoto loop\r\n:found\r\nshift\r\n<nul set /p =pwsh:%~1\r\n:done\r\n",
         )
         .expect("write script");
-        std::process::Command::new("/bin/chmod")
-            .arg("+x")
-            .arg(&script)
-            .status()
-            .expect("chmod");
-        let original_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{}:{}", dir.display(), original_path));
+        #[cfg(not(windows))]
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nwhile [ \"$1\" != \"-Command\" ] && [ $# -gt 0 ]; do shift; done\nshift\nprintf 'pwsh:%s' \"$1\"\n",
+        )
+        .expect("write script");
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = std::fs::metadata(&script)
+                .expect("script metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&script, permissions).expect("chmod");
+        }
+        let original_path = std::env::var_os("PATH").unwrap_or_default();
+        let updated_path = std::env::join_paths(
+            std::iter::once(dir.clone()).chain(std::env::split_paths(&original_path)),
+        )
+        .expect("join PATH");
+        std::env::set_var("PATH", &updated_path);
 
         let result = execute_tool(
             "PowerShell",
@@ -5813,7 +5880,10 @@ printf 'pwsh:%s' "$1"
     fn given_read_only_enforcer_when_write_file_then_denied() {
         let registry = read_only_registry();
         let err = registry
-            .execute("write_file", &json!({ "path": "/tmp/x.txt", "content": "x" }))
+            .execute(
+                "write_file",
+                &json!({ "path": "/tmp/x.txt", "content": "x" }),
+            )
             .expect_err("write_file should be denied in read-only mode");
         assert!(
             err.contains("current mode is read-only"),
@@ -5847,10 +5917,7 @@ printf 'pwsh:%s' "$1"
         fs::write(&file, "content\n").expect("write test file");
 
         let registry = read_only_registry();
-        let result = registry.execute(
-            "read_file",
-            &json!({ "path": file.display().to_string() }),
-        );
+        let result = registry.execute("read_file", &json!({ "path": file.display().to_string() }));
         assert!(result.is_ok(), "read_file should be allowed: {result:?}");
 
         let _ = fs::remove_dir_all(root);

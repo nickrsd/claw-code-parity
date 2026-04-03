@@ -25,8 +25,8 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
     resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
-    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
-    ProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache, ProviderClient,
+    ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
     ToolResultContentBlock,
 };
 
@@ -41,8 +41,7 @@ use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
     clear_oauth_credentials, generate_pkce_pair, generate_state, load_system_prompt,
-    parse_oauth_callback_request_target,
-    permission_enforcer::PermissionEnforcer,
+    parse_oauth_callback_request_target, permission_enforcer::PermissionEnforcer,
     resolve_sandbox_status, save_oauth_credentials, ApiClient, ApiRequest, AssistantEvent,
     CompactionConfig, ConfigLoader, ConfigSource, ContentBlock, ConversationMessage,
     ConversationRuntime, MessageRole, OAuthAuthorizationRequest, OAuthConfig,
@@ -580,6 +579,9 @@ fn resolve_model_alias(model: &str) -> String {
 }
 
 fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, String> {
+    if values.is_empty() {
+        return Ok(None);
+    }
     current_tool_registry()?.normalize_allowed_tools(values)
 }
 
@@ -4109,10 +4111,8 @@ impl CliRuntimeClient {
         let anthropic_auth = matches!(provider_kind, ProviderKind::Anthropic)
             .then(resolve_cli_auth_source)
             .transpose()?;
-        let client =
-            ProviderClient::from_model_with_anthropic_auth(&model, anthropic_auth)?.with_prompt_cache(
-                PromptCache::new(session_id),
-            );
+        let client = ProviderClient::from_model_with_anthropic_auth(&model, anthropic_auth)?
+            .with_prompt_cache(PromptCache::new(session_id));
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             client,
@@ -5238,11 +5238,14 @@ mod tests {
     }
 
     fn temp_dir() -> PathBuf {
+        static NEXT_TEMP_DIR_ID: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time should be after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("rusty-claude-cli-{nanos}"))
+        let unique_id = NEXT_TEMP_DIR_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("rusty-claude-cli-{nanos}-{unique_id}"))
     }
 
     fn git(args: &[&str], cwd: &Path) {
@@ -5266,10 +5269,40 @@ mod tests {
     }
 
     fn with_current_dir<T>(cwd: &Path, f: impl FnOnce() -> T) -> T {
+        let _guard = cwd_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = std::env::current_dir().expect("cwd should load");
         std::env::set_current_dir(cwd).expect("cwd should change");
         let result = f();
         std::env::set_current_dir(previous).expect("cwd should restore");
+        result
+    }
+
+    fn parse_args_for_test(args: &[String]) -> Result<CliAction, String> {
+        let _guard = env_lock();
+        let root = temp_workspace("parse-args");
+        let cwd = root.join("workspace");
+        let config_home = root.join("config-home");
+        fs::create_dir_all(&cwd).expect("workspace should create");
+        fs::create_dir_all(&config_home).expect("config home should create");
+
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_permission_mode = std::env::var("RUSTY_CLAUDE_PERMISSION_MODE").ok();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+
+        let result = with_current_dir(&cwd, || parse_args(args));
+
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_permission_mode {
+            Some(value) => std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value),
+            None => std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE"),
+        }
+        fs::remove_dir_all(root).expect("parse args temp root should clean up");
         result
     }
 
@@ -5318,7 +5351,7 @@ mod tests {
     #[test]
     fn defaults_to_repl_when_no_args() {
         assert_eq!(
-            parse_args(&[]).expect("args should parse"),
+            parse_args_for_test(&[]).expect("args should parse"),
             CliAction::Repl {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
@@ -5403,7 +5436,7 @@ mod tests {
             "world".to_string(),
         ];
         assert_eq!(
-            parse_args(&args).expect("args should parse"),
+            parse_args_for_test(&args).expect("args should parse"),
             CliAction::Prompt {
                 prompt: "hello world".to_string(),
                 model: DEFAULT_MODEL.to_string(),
@@ -5424,7 +5457,7 @@ mod tests {
             "this".to_string(),
         ];
         assert_eq!(
-            parse_args(&args).expect("args should parse"),
+            parse_args_for_test(&args).expect("args should parse"),
             CliAction::Prompt {
                 prompt: "explain this".to_string(),
                 model: "claude-opus".to_string(),
@@ -5444,7 +5477,7 @@ mod tests {
             "this".to_string(),
         ];
         assert_eq!(
-            parse_args(&args).expect("args should parse"),
+            parse_args_for_test(&args).expect("args should parse"),
             CliAction::Prompt {
                 prompt: "explain this".to_string(),
                 model: "claude-opus-4-6".to_string(),
@@ -5468,11 +5501,11 @@ mod tests {
     #[test]
     fn parses_version_flags_without_initializing_prompt_mode() {
         assert_eq!(
-            parse_args(&["--version".to_string()]).expect("args should parse"),
+            parse_args_for_test(&["--version".to_string()]).expect("args should parse"),
             CliAction::Version
         );
         assert_eq!(
-            parse_args(&["-V".to_string()]).expect("args should parse"),
+            parse_args_for_test(&["-V".to_string()]).expect("args should parse"),
             CliAction::Version
         );
     }
@@ -5481,7 +5514,7 @@ mod tests {
     fn parses_permission_mode_flag() {
         let args = vec!["--permission-mode=read-only".to_string()];
         assert_eq!(
-            parse_args(&args).expect("args should parse"),
+            parse_args_for_test(&args).expect("args should parse"),
             CliAction::Repl {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
@@ -5498,7 +5531,7 @@ mod tests {
             "--allowed-tools=write_file".to_string(),
         ];
         assert_eq!(
-            parse_args(&args).expect("args should parse"),
+            parse_args_for_test(&args).expect("args should parse"),
             CliAction::Repl {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: Some(
@@ -5514,7 +5547,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_allowed_tools() {
-        let error = parse_args(&["--allowedTools".to_string(), "teleport".to_string()])
+        let error = parse_args_for_test(&["--allowedTools".to_string(), "teleport".to_string()])
             .expect_err("tool should be rejected");
         assert!(error.contains("unsupported tool in --allowedTools: teleport"));
     }
@@ -5529,7 +5562,7 @@ mod tests {
             "2026-04-01".to_string(),
         ];
         assert_eq!(
-            parse_args(&args).expect("args should parse"),
+            parse_args_for_test(&args).expect("args should parse"),
             CliAction::PrintSystemPrompt {
                 cwd: PathBuf::from("/tmp/project"),
                 date: "2026-04-01".to_string(),
@@ -5540,31 +5573,31 @@ mod tests {
     #[test]
     fn parses_login_and_logout_subcommands() {
         assert_eq!(
-            parse_args(&["login".to_string()]).expect("login should parse"),
+            parse_args_for_test(&["login".to_string()]).expect("login should parse"),
             CliAction::Login
         );
         assert_eq!(
-            parse_args(&["logout".to_string()]).expect("logout should parse"),
+            parse_args_for_test(&["logout".to_string()]).expect("logout should parse"),
             CliAction::Logout
         );
         assert_eq!(
-            parse_args(&["init".to_string()]).expect("init should parse"),
+            parse_args_for_test(&["init".to_string()]).expect("init should parse"),
             CliAction::Init
         );
         assert_eq!(
-            parse_args(&["agents".to_string()]).expect("agents should parse"),
+            parse_args_for_test(&["agents".to_string()]).expect("agents should parse"),
             CliAction::Agents { args: None }
         );
         assert_eq!(
-            parse_args(&["mcp".to_string()]).expect("mcp should parse"),
+            parse_args_for_test(&["mcp".to_string()]).expect("mcp should parse"),
             CliAction::Mcp { args: None }
         );
         assert_eq!(
-            parse_args(&["skills".to_string()]).expect("skills should parse"),
+            parse_args_for_test(&["skills".to_string()]).expect("skills should parse"),
             CliAction::Skills { args: None }
         );
         assert_eq!(
-            parse_args(&["agents".to_string(), "--help".to_string()])
+            parse_args_for_test(&["agents".to_string(), "--help".to_string()])
                 .expect("agents help should parse"),
             CliAction::Agents {
                 args: Some("--help".to_string())
@@ -5575,29 +5608,30 @@ mod tests {
     #[test]
     fn parses_single_word_command_aliases_without_falling_back_to_prompt_mode() {
         assert_eq!(
-            parse_args(&["help".to_string()]).expect("help should parse"),
+            parse_args_for_test(&["help".to_string()]).expect("help should parse"),
             CliAction::Help
         );
         assert_eq!(
-            parse_args(&["version".to_string()]).expect("version should parse"),
+            parse_args_for_test(&["version".to_string()]).expect("version should parse"),
             CliAction::Version
         );
         assert_eq!(
-            parse_args(&["status".to_string()]).expect("status should parse"),
+            parse_args_for_test(&["status".to_string()]).expect("status should parse"),
             CliAction::Status {
                 model: DEFAULT_MODEL.to_string(),
                 permission_mode: PermissionMode::DangerFullAccess,
             }
         );
         assert_eq!(
-            parse_args(&["sandbox".to_string()]).expect("sandbox should parse"),
+            parse_args_for_test(&["sandbox".to_string()]).expect("sandbox should parse"),
             CliAction::Sandbox
         );
     }
 
     #[test]
     fn single_word_slash_command_names_return_guidance_instead_of_hitting_prompt_mode() {
-        let error = parse_args(&["cost".to_string()]).expect_err("cost should return guidance");
+        let error =
+            parse_args_for_test(&["cost".to_string()]).expect_err("cost should return guidance");
         assert!(error.contains("slash command"));
         assert!(error.contains("/cost"));
     }
@@ -5605,7 +5639,7 @@ mod tests {
     #[test]
     fn multi_word_prompt_still_uses_shorthand_prompt_mode() {
         assert_eq!(
-            parse_args(&["help".to_string(), "me".to_string(), "debug".to_string()])
+            parse_args_for_test(&["help".to_string(), "me".to_string(), "debug".to_string()])
                 .expect("prompt shorthand should still work"),
             CliAction::Prompt {
                 prompt: "help me debug".to_string(),
@@ -5620,29 +5654,29 @@ mod tests {
     #[test]
     fn parses_direct_agents_mcp_and_skills_slash_commands() {
         assert_eq!(
-            parse_args(&["/agents".to_string()]).expect("/agents should parse"),
+            parse_args_for_test(&["/agents".to_string()]).expect("/agents should parse"),
             CliAction::Agents { args: None }
         );
         assert_eq!(
-            parse_args(&["/mcp".to_string(), "show".to_string(), "demo".to_string()])
+            parse_args_for_test(&["/mcp".to_string(), "show".to_string(), "demo".to_string()])
                 .expect("/mcp show demo should parse"),
             CliAction::Mcp {
                 args: Some("show demo".to_string())
             }
         );
         assert_eq!(
-            parse_args(&["/skills".to_string()]).expect("/skills should parse"),
+            parse_args_for_test(&["/skills".to_string()]).expect("/skills should parse"),
             CliAction::Skills { args: None }
         );
         assert_eq!(
-            parse_args(&["/skills".to_string(), "help".to_string()])
+            parse_args_for_test(&["/skills".to_string(), "help".to_string()])
                 .expect("/skills help should parse"),
             CliAction::Skills {
                 args: Some("help".to_string())
             }
         );
         assert_eq!(
-            parse_args(&[
+            parse_args_for_test(&[
                 "/skills".to_string(),
                 "install".to_string(),
                 "./fixtures/help-skill".to_string(),
@@ -5652,7 +5686,7 @@ mod tests {
                 args: Some("install ./fixtures/help-skill".to_string())
             }
         );
-        let error = parse_args(&["/status".to_string()])
+        let error = parse_args_for_test(&["/status".to_string()])
             .expect_err("/status should remain REPL-only when invoked directly");
         assert!(error.contains("interactive-only"));
         assert!(error.contains("claw --resume SESSION.jsonl /status"));
@@ -5660,12 +5694,12 @@ mod tests {
 
     #[test]
     fn direct_slash_commands_surface_shared_validation_errors() {
-        let compact_error = parse_args(&["/compact".to_string(), "now".to_string()])
+        let compact_error = parse_args_for_test(&["/compact".to_string(), "now".to_string()])
             .expect_err("invalid /compact shape should be rejected");
         assert!(compact_error.contains("Unexpected arguments for /compact."));
         assert!(compact_error.contains("Usage            /compact"));
 
-        let plugins_error = parse_args(&[
+        let plugins_error = parse_args_for_test(&[
             "/plugins".to_string(),
             "list".to_string(),
             "extra".to_string(),
@@ -5691,7 +5725,7 @@ mod tests {
             "/compact".to_string(),
         ];
         assert_eq!(
-            parse_args(&args).expect("args should parse"),
+            parse_args_for_test(&args).expect("args should parse"),
             CliAction::ResumeSession {
                 session_path: PathBuf::from("session.jsonl"),
                 commands: vec!["/compact".to_string()],
@@ -5702,14 +5736,14 @@ mod tests {
     #[test]
     fn parses_resume_flag_without_path_as_latest_session() {
         assert_eq!(
-            parse_args(&["--resume".to_string()]).expect("args should parse"),
+            parse_args_for_test(&["--resume".to_string()]).expect("args should parse"),
             CliAction::ResumeSession {
                 session_path: PathBuf::from("latest"),
                 commands: vec![],
             }
         );
         assert_eq!(
-            parse_args(&["--resume".to_string(), "/status".to_string()])
+            parse_args_for_test(&["--resume".to_string(), "/status".to_string()])
                 .expect("resume shortcut should parse"),
             CliAction::ResumeSession {
                 session_path: PathBuf::from("latest"),
@@ -5728,7 +5762,7 @@ mod tests {
             "/cost".to_string(),
         ];
         assert_eq!(
-            parse_args(&args).expect("args should parse"),
+            parse_args_for_test(&args).expect("args should parse"),
             CliAction::ResumeSession {
                 session_path: PathBuf::from("session.jsonl"),
                 commands: vec![
@@ -5742,7 +5776,8 @@ mod tests {
 
     #[test]
     fn rejects_unknown_options_with_helpful_guidance() {
-        let error = parse_args(&["--resum".to_string()]).expect_err("unknown option should fail");
+        let error =
+            parse_args_for_test(&["--resum".to_string()]).expect_err("unknown option should fail");
         assert!(error.contains("unknown option: --resum"));
         assert!(error.contains("Did you mean --resume?"));
         assert!(error.contains("claw --help"));
@@ -5759,7 +5794,7 @@ mod tests {
             "--confirm".to_string(),
         ];
         assert_eq!(
-            parse_args(&args).expect("args should parse"),
+            parse_args_for_test(&args).expect("args should parse"),
             CliAction::ResumeSession {
                 session_path: PathBuf::from("session.jsonl"),
                 commands: vec![
@@ -5780,7 +5815,7 @@ mod tests {
             "/status".to_string(),
         ];
         assert_eq!(
-            parse_args(&args).expect("args should parse"),
+            parse_args_for_test(&args).expect("args should parse"),
             CliAction::ResumeSession {
                 session_path: PathBuf::from("session.jsonl"),
                 commands: vec!["/export /tmp/notes.txt".to_string(), "/status".to_string()],
@@ -6528,11 +6563,14 @@ UU conflicted.rs",
     }
 
     fn temp_workspace(label: &str) -> PathBuf {
+        static NEXT_WORKSPACE_ID: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time should be after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("claw-cli-{label}-{nanos}"))
+        let unique_id = NEXT_WORKSPACE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("claw-cli-{label}-{nanos}-{unique_id}"))
     }
 
     #[test]
