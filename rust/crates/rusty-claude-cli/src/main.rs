@@ -6,6 +6,7 @@
     clippy::unnecessary_wraps,
     clippy::unused_self
 )]
+mod clauvellian_app;
 mod init;
 mod input;
 mod render;
@@ -28,6 +29,9 @@ use api::{
     InputMessage, MessageRequest, MessageResponse, OutputContentBlock, PromptCache, ProviderClient,
     ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
     ToolResultContentBlock,
+};
+use clauvellian_app::{
+    launch_clauvellian_app, ClauvellianBridgeEvent, ClauvellianEventSink, ClauvellianLaunchConfig,
 };
 
 use commands::{
@@ -130,6 +134,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Login => run_login()?,
         CliAction::Logout => run_logout()?,
         CliAction::Init => run_init()?,
+        CliAction::App {
+            model,
+            allowed_tools,
+            permission_mode,
+        } => launch_clauvellian_app(ClauvellianLaunchConfig {
+            model,
+            allowed_tools,
+            permission_mode,
+        })?,
         CliAction::Repl {
             model,
             allowed_tools,
@@ -177,6 +190,11 @@ enum CliAction {
     Login,
     Logout,
     Init,
+    App {
+        model: String,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
+    },
     Repl {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
@@ -355,6 +373,16 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "login" => Ok(CliAction::Login),
         "logout" => Ok(CliAction::Logout),
         "init" => Ok(CliAction::Init),
+        "app" | "desktop" => {
+            if rest.len() > 1 {
+                return Err("app subcommand does not accept additional arguments".to_string());
+            }
+            Ok(CliAction::App {
+                model,
+                allowed_tools,
+                permission_mode,
+            })
+        }
         "prompt" => {
             let prompt = rest[1..].join(" ");
             if prompt.trim().is_empty() {
@@ -3626,11 +3654,18 @@ struct InternalPromptProgressShared {
     state: Mutex<InternalPromptProgressState>,
     output_lock: Mutex<()>,
     started_at: Instant,
+    target: InternalPromptProgressTarget,
 }
 
 #[derive(Debug, Clone)]
 struct InternalPromptProgressReporter {
     shared: Arc<InternalPromptProgressShared>,
+}
+
+#[derive(Debug, Clone)]
+enum InternalPromptProgressTarget {
+    Stdout,
+    Clauvellian(ClauvellianEventSink),
 }
 
 #[derive(Debug)]
@@ -3642,10 +3677,22 @@ struct InternalPromptProgressRun {
 
 impl InternalPromptProgressReporter {
     fn ultraplan(task: &str) -> Self {
+        Self::new("Ultraplan", task, InternalPromptProgressTarget::Stdout)
+    }
+
+    fn clauvellian(task: &str, event_sink: ClauvellianEventSink) -> Self {
+        Self::new(
+            "Clauvellian",
+            task,
+            InternalPromptProgressTarget::Clauvellian(event_sink),
+        )
+    }
+
+    fn new(command_label: &'static str, task: &str, target: InternalPromptProgressTarget) -> Self {
         Self {
             shared: Arc::new(InternalPromptProgressShared {
                 state: Mutex::new(InternalPromptProgressState {
-                    command_label: "Ultraplan",
+                    command_label,
                     task_label: task.to_string(),
                     step: 0,
                     phase: "planning started".to_string(),
@@ -3654,6 +3701,7 @@ impl InternalPromptProgressReporter {
                 }),
                 output_lock: Mutex::new(()),
                 started_at: Instant::now(),
+                target,
             }),
         }
     }
@@ -3761,14 +3809,23 @@ impl InternalPromptProgressReporter {
     }
 
     fn write_line(&self, line: &str) {
-        let _guard = self
-            .shared
-            .output_lock
-            .lock()
-            .expect("internal prompt progress output lock poisoned");
-        let mut stdout = io::stdout();
-        let _ = writeln!(stdout, "{line}");
-        let _ = stdout.flush();
+        match &self.shared.target {
+            InternalPromptProgressTarget::Stdout => {
+                let _guard = self
+                    .shared
+                    .output_lock
+                    .lock()
+                    .expect("internal prompt progress output lock poisoned");
+                let mut stdout = io::stdout();
+                let _ = writeln!(stdout, "{line}");
+                let _ = stdout.flush();
+            }
+            InternalPromptProgressTarget::Clauvellian(event_sink) => {
+                let _ = event_sink.send(ClauvellianBridgeEvent::ProgressLine {
+                    line: line.to_string(),
+                });
+            }
+        }
     }
 }
 
@@ -3960,6 +4017,36 @@ fn build_runtime(
 
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_arguments)]
+fn build_runtime_with_events(
+    session: Session,
+    session_id: &str,
+    model: String,
+    system_prompt: Vec<String>,
+    enable_tools: bool,
+    emit_output: bool,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+    progress_reporter: Option<InternalPromptProgressReporter>,
+    event_sink: Option<ClauvellianEventSink>,
+) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
+    let runtime_plugin_state = build_runtime_plugin_state()?;
+    build_runtime_with_plugin_state_with_events(
+        session,
+        session_id,
+        model,
+        system_prompt,
+        enable_tools,
+        emit_output,
+        allowed_tools,
+        permission_mode,
+        progress_reporter,
+        event_sink,
+        runtime_plugin_state,
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_arguments)]
 fn build_runtime_with_plugin_state(
     session: Session,
     session_id: &str,
@@ -3970,6 +4057,36 @@ fn build_runtime_with_plugin_state(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
+    runtime_plugin_state: RuntimePluginState,
+) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
+    build_runtime_with_plugin_state_with_events(
+        session,
+        session_id,
+        model,
+        system_prompt,
+        enable_tools,
+        emit_output,
+        allowed_tools,
+        permission_mode,
+        progress_reporter,
+        None,
+        runtime_plugin_state,
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_arguments)]
+fn build_runtime_with_plugin_state_with_events(
+    session: Session,
+    session_id: &str,
+    model: String,
+    system_prompt: Vec<String>,
+    enable_tools: bool,
+    emit_output: bool,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+    progress_reporter: Option<InternalPromptProgressReporter>,
+    event_sink: Option<ClauvellianEventSink>,
     runtime_plugin_state: RuntimePluginState,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     let RuntimePluginState {
@@ -3992,8 +4109,14 @@ fn build_runtime_with_plugin_state(
             allowed_tools.clone(),
             tool_registry.clone(),
             progress_reporter,
+            event_sink.clone(),
         )?,
-        CliToolExecutor::new(allowed_tools.clone(), emit_output, tool_registry),
+        CliToolExecutor::new(
+            allowed_tools.clone(),
+            emit_output,
+            tool_registry,
+            event_sink,
+        ),
         policy,
         system_prompt,
         &feature_config,
@@ -4095,6 +4218,7 @@ struct CliRuntimeClient {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
+    event_sink: Option<ClauvellianEventSink>,
 }
 
 impl CliRuntimeClient {
@@ -4106,6 +4230,7 @@ impl CliRuntimeClient {
         allowed_tools: Option<AllowedToolSet>,
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
+        event_sink: Option<ClauvellianEventSink>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let provider_kind = api::detect_provider_kind(&model);
         let anthropic_auth = matches!(provider_kind, ProviderKind::Anthropic)
@@ -4122,6 +4247,7 @@ impl CliRuntimeClient {
             allowed_tools,
             tool_registry,
             progress_reporter,
+            event_sink,
         })
     }
 }
@@ -4204,6 +4330,11 @@ impl ApiClient for CliRuntimeClient {
                                         .and_then(|()| out.flush())
                                         .map_err(|error| RuntimeError::new(error.to_string()))?;
                                 }
+                                if let Some(event_sink) = &self.event_sink {
+                                    let _ = event_sink.send(ClauvellianBridgeEvent::TextDelta {
+                                        delta: text.clone(),
+                                    });
+                                }
                                 events.push(AssistantEvent::TextDelta(text));
                             }
                         }
@@ -4229,11 +4360,23 @@ impl ApiClient for CliRuntimeClient {
                             writeln!(out, "\n{}", format_tool_call_start(&name, &input))
                                 .and_then(|()| out.flush())
                                 .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            if let Some(event_sink) = &self.event_sink {
+                                let _ = event_sink.send(ClauvellianBridgeEvent::ToolCallStart {
+                                    name: name.clone(),
+                                    input: input.clone(),
+                                });
+                            }
                             events.push(AssistantEvent::ToolUse { id, name, input });
                         }
                     }
                     ApiStreamEvent::MessageDelta(delta) => {
-                        events.push(AssistantEvent::Usage(delta.usage.token_usage()));
+                        let usage = delta.usage.token_usage();
+                        if let Some(event_sink) = &self.event_sink {
+                            let _ = event_sink.send(ClauvellianBridgeEvent::Usage {
+                                usage: usage.clone(),
+                            });
+                        }
+                        events.push(AssistantEvent::Usage(usage));
                     }
                     ApiStreamEvent::MessageStop(_) => {
                         saw_stop = true;
@@ -4944,6 +5087,7 @@ struct CliToolExecutor {
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
+    event_sink: Option<ClauvellianEventSink>,
 }
 
 impl CliToolExecutor {
@@ -4951,12 +5095,14 @@ impl CliToolExecutor {
         allowed_tools: Option<AllowedToolSet>,
         emit_output: bool,
         tool_registry: GlobalToolRegistry,
+        event_sink: Option<ClauvellianEventSink>,
     ) -> Self {
         Self {
             renderer: TerminalRenderer::new(),
             emit_output,
             allowed_tools,
             tool_registry,
+            event_sink,
         }
     }
 }
@@ -4976,8 +5122,15 @@ impl ToolExecutor for CliToolExecutor {
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
         match self.tool_registry.execute(tool_name, &value) {
             Ok(output) => {
+                let markdown = format_tool_result(tool_name, &output, false);
+                if let Some(event_sink) = &self.event_sink {
+                    let _ = event_sink.send(ClauvellianBridgeEvent::ToolCallResult {
+                        name: tool_name.to_string(),
+                        output: markdown.clone(),
+                        is_error: false,
+                    });
+                }
                 if self.emit_output {
-                    let markdown = format_tool_result(tool_name, &output, false);
                     self.renderer
                         .stream_markdown(&markdown, &mut io::stdout())
                         .map_err(|error| ToolError::new(error.to_string()))?;
@@ -4985,8 +5138,15 @@ impl ToolExecutor for CliToolExecutor {
                 Ok(output)
             }
             Err(error) => {
+                let markdown = format_tool_result(tool_name, &error, true);
+                if let Some(event_sink) = &self.event_sink {
+                    let _ = event_sink.send(ClauvellianBridgeEvent::ToolCallResult {
+                        name: tool_name.to_string(),
+                        output: markdown.clone(),
+                        is_error: true,
+                    });
+                }
                 if self.emit_output {
-                    let markdown = format_tool_result(tool_name, &error, true);
                     self.renderer
                         .stream_markdown(&markdown, &mut io::stdout())
                         .map_err(|stream_error| ToolError::new(stream_error.to_string()))?;
@@ -5099,6 +5259,8 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw login")?;
     writeln!(out, "  claw logout")?;
     writeln!(out, "  claw init")?;
+    writeln!(out, "  claw app")?;
+    writeln!(out, "      Launch the Clauvellian desktop shell")?;
     writeln!(out)?;
     writeln!(out, "Flags:")?;
     writeln!(
@@ -5441,6 +5603,23 @@ mod tests {
                 prompt: "hello world".to_string(),
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_app_subcommand() {
+        let args = vec![
+            "--model".to_string(),
+            "gpt-5.4".to_string(),
+            "app".to_string(),
+        ];
+        assert_eq!(
+            parse_args_for_test(&args).expect("args should parse"),
+            CliAction::App {
+                model: "gpt-5.4".to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
             }
@@ -6061,6 +6240,7 @@ mod tests {
         assert!(help.contains("claw status"));
         assert!(help.contains("claw sandbox"));
         assert!(help.contains("claw init"));
+        assert!(help.contains("claw app"));
         assert!(help.contains("claw agents"));
         assert!(help.contains("claw mcp"));
         assert!(help.contains("claw skills"));
