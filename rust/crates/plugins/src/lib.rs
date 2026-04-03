@@ -20,6 +20,31 @@ const REGISTRY_FILE_NAME: &str = "installed.json";
 const MANIFEST_FILE_NAME: &str = "plugin.json";
 const MANIFEST_RELATIVE_PATH: &str = ".claude-plugin/plugin.json";
 
+#[cfg(windows)]
+fn find_windows_posix_shell() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .flat_map(|dir| candidate_windows_posix_shells(&dir))
+        .find(|candidate| {
+            candidate.is_file()
+                && !candidate
+                    .to_string_lossy()
+                    .contains("WindowsApps")
+        })
+}
+
+#[cfg(windows)]
+fn candidate_windows_posix_shells(dir: &Path) -> Vec<PathBuf> {
+    vec![dir.join("bash.exe"), dir.join("sh.exe")]
+}
+
+#[cfg(windows)]
+fn is_shell_script_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("sh"))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PluginKind {
@@ -303,9 +328,34 @@ impl PluginTool {
 
     pub fn execute(&self, input: &Value) -> Result<String, PluginError> {
         let input_json = input.to_string();
-        let mut process = Command::new(&self.command);
+        #[cfg(windows)]
+        let mut process = {
+            let command_path = Path::new(&self.command);
+            if command_path.exists() && is_shell_script_path(command_path) {
+                if let Some(shell_path) = find_windows_posix_shell() {
+                    let mut process = Command::new(shell_path);
+                    process.arg(&self.command).args(&self.args);
+                    process
+                } else {
+                    let mut process = Command::new(&self.command);
+                    process.args(&self.args);
+                    process
+                }
+            } else {
+                let mut process = Command::new(&self.command);
+                process.args(&self.args);
+                process
+            }
+        };
+
+        #[cfg(not(windows))]
+        let mut process = {
+            let mut process = Command::new(&self.command);
+            process.args(&self.args);
+            process
+        };
+
         process
-            .args(&self.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -2013,19 +2063,37 @@ fn run_lifecycle_commands(
     }
 
     for command in commands {
+        #[cfg(windows)]
         let mut process = if Path::new(command).exists() {
-            if cfg!(windows) {
+            if is_shell_script_path(Path::new(command)) {
+                if let Some(shell_path) = find_windows_posix_shell() {
+                    let mut process = Command::new(shell_path);
+                    process.arg(command);
+                    process
+                } else {
+                    let mut process = Command::new("cmd");
+                    process.arg("/C").arg(command);
+                    process
+                }
+            } else {
                 let mut process = Command::new("cmd");
                 process.arg("/C").arg(command);
                 process
-            } else {
-                let mut process = Command::new("sh");
-                process.arg(command);
-                process
             }
-        } else if cfg!(windows) {
+        } else if let Some(shell_path) = find_windows_posix_shell() {
+            let mut process = Command::new(shell_path);
+            process.arg("-lc").arg(command);
+            process
+        } else {
             let mut process = Command::new("cmd");
             process.arg("/C").arg(command);
+            process
+        };
+
+        #[cfg(not(windows))]
+        let mut process = if Path::new(command).exists() {
+            let mut process = Command::new("sh");
+            process.arg(command);
             process
         } else {
             let mut process = Command::new("sh");

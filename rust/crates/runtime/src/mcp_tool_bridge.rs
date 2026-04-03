@@ -310,7 +310,6 @@ impl McpToolRegistry {
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -328,6 +327,57 @@ mod tests {
             .as_nanos();
         let unique_id = NEXT_TEMP_DIR_ID.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("runtime-mcp-tool-bridge-{nanos}-{unique_id}"))
+    }
+
+    #[cfg(unix)]
+    fn mark_executable(script_path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(script_path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(script_path, permissions).expect("chmod");
+    }
+
+    #[cfg(not(unix))]
+    fn mark_executable(_: &Path) {}
+
+    fn python_command() -> String {
+        std::env::var("PYTHON")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(find_python_on_path)
+            .unwrap_or_else(|| {
+                if cfg!(windows) {
+                    "python".to_string()
+                } else {
+                    "python3".to_string()
+                }
+            })
+    }
+
+    fn find_python_on_path() -> Option<String> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .flat_map(|dir| candidate_python_paths(&dir))
+            .find(|candidate| {
+                candidate.is_file()
+                    && !candidate
+                        .to_string_lossy()
+                        .contains("WindowsApps")
+            })
+            .map(|candidate| candidate.to_string_lossy().into_owned())
+    }
+
+    fn candidate_python_paths(dir: &Path) -> Vec<PathBuf> {
+        if cfg!(windows) {
+            vec![
+                dir.join("python3.exe"),
+                dir.join("python.exe"),
+                dir.join("py.exe"),
+            ]
+        } else {
+            vec![dir.join("python3"), dir.join("python")]
+        }
     }
 
     fn cleanup_script(script_path: &Path) {
@@ -426,9 +476,7 @@ mod tests {
         ]
         .join("\n");
         fs::write(&script_path, script).expect("write script");
-        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).expect("chmod");
+        mark_executable(&script_path);
         script_path
     }
 
@@ -440,7 +488,7 @@ mod tests {
         ScopedMcpServerConfig {
             scope: ConfigSource::Local,
             config: McpServerConfig::Stdio(McpStdioServerConfig {
-                command: "python3".to_string(),
+                command: python_command(),
                 args: vec![script_path.to_string_lossy().into_owned()],
                 env: BTreeMap::from([
                     ("MCP_SERVER_LABEL".to_string(), server_name.to_string()),

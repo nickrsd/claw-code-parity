@@ -1,5 +1,5 @@
 use std::ffi::OsStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::json;
@@ -281,9 +281,21 @@ fn format_hook_warning(command: &str, code: i32, stdout: Option<&str>, stderr: &
 fn shell_command(command: &str) -> CommandWithStdin {
     #[cfg(windows)]
     let command_builder = {
-        let mut command_builder = Command::new("cmd");
-        command_builder.arg("/C").arg(command);
-        CommandWithStdin::new(command_builder)
+        if let Some(shell_path) = find_windows_posix_shell() {
+            if Path::new(command).exists() {
+                let mut command_builder = Command::new(shell_path);
+                command_builder.arg(command);
+                CommandWithStdin::new(command_builder)
+            } else {
+                let mut command_builder = Command::new(shell_path);
+                command_builder.arg("-lc").arg(command);
+                CommandWithStdin::new(command_builder)
+            }
+        } else {
+            let mut command_builder = Command::new("cmd");
+            command_builder.arg("/C").arg(command);
+            CommandWithStdin::new(command_builder)
+        }
     };
 
     #[cfg(not(windows))]
@@ -298,6 +310,24 @@ fn shell_command(command: &str) -> CommandWithStdin {
     };
 
     command_builder
+}
+
+#[cfg(windows)]
+fn find_windows_posix_shell() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .flat_map(|dir| candidate_windows_posix_shells(&dir))
+        .find(|candidate| {
+            candidate.is_file()
+                && !candidate
+                    .to_string_lossy()
+                    .contains("WindowsApps")
+        })
+}
+
+#[cfg(windows)]
+fn candidate_windows_posix_shells(dir: &Path) -> Vec<PathBuf> {
+    vec![dir.join("bash.exe"), dir.join("sh.exe")]
 }
 
 struct CommandWithStdin {

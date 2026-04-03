@@ -46,6 +46,36 @@ fn provider_client_uses_explicit_anthropic_auth_without_env_lookup() {
 }
 
 #[test]
+fn provider_client_routes_explicit_openai_models_even_when_anthropic_auth_exists() {
+    let _lock = env_lock();
+    let _anthropic_api_key = EnvVarGuard::set("ANTHROPIC_API_KEY", Some("anthropic-test-key"));
+    let _openai_api_key = EnvVarGuard::set("OPENAI_API_KEY", Some("openai-test-key"));
+
+    let client = ProviderClient::from_model("gpt-5.4")
+        .expect("OpenAI model families should not fall back to Anthropic auth");
+
+    assert_eq!(client.provider_kind(), ProviderKind::OpenAi);
+}
+
+#[test]
+fn provider_client_reports_missing_openai_credentials_for_openai_models() {
+    let _lock = env_lock();
+    let _openai_api_key = EnvVarGuard::set("OPENAI_API_KEY", None);
+    let _anthropic_api_key = EnvVarGuard::set("ANTHROPIC_API_KEY", Some("anthropic-test-key"));
+
+    let error = ProviderClient::from_model("gpt-5.4")
+        .expect_err("OpenAI model requests without OPENAI_API_KEY should fail fast");
+
+    match error {
+        ApiError::MissingCredentials { provider, env_vars } => {
+            assert_eq!(provider, "OpenAI");
+            assert_eq!(env_vars, &["OPENAI_API_KEY"]);
+        }
+        other => panic!("expected missing OpenAI credentials, got {other:?}"),
+    }
+}
+
+#[test]
 fn read_xai_base_url_prefers_env_override() {
     let _lock = env_lock();
     let _xai_base_url = EnvVarGuard::set("XAI_BASE_URL", Some("https://example.xai.test/v1"));

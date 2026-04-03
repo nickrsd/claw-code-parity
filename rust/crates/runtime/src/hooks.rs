@@ -1,5 +1,6 @@
 use std::ffi::OsStr;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -634,9 +635,15 @@ fn format_hook_failure(command: &str, code: i32, stdout: Option<&str>, stderr: &
 fn shell_command(command: &str) -> CommandWithStdin {
     #[cfg(windows)]
     let mut command_builder = {
-        let mut command_builder = Command::new("cmd");
-        command_builder.arg("/C").arg(command);
-        CommandWithStdin::new(command_builder)
+        if let Some(shell_path) = find_windows_posix_shell() {
+            let mut command_builder = Command::new(shell_path);
+            command_builder.arg("-lc").arg(command);
+            CommandWithStdin::new(command_builder)
+        } else {
+            let mut command_builder = Command::new("cmd");
+            command_builder.arg("/C").arg(command);
+            CommandWithStdin::new(command_builder)
+        }
     };
 
     #[cfg(not(windows))]
@@ -647,6 +654,24 @@ fn shell_command(command: &str) -> CommandWithStdin {
     };
 
     command_builder
+}
+
+#[cfg(windows)]
+fn find_windows_posix_shell() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .flat_map(|dir| candidate_windows_posix_shells(&dir))
+        .find(|candidate| {
+            candidate.is_file()
+                && !candidate
+                    .to_string_lossy()
+                    .contains("WindowsApps")
+        })
+}
+
+#[cfg(windows)]
+fn candidate_windows_posix_shells(dir: &Path) -> Vec<PathBuf> {
+    vec![dir.join("bash.exe"), dir.join("sh.exe")]
 }
 
 struct CommandWithStdin {
@@ -975,12 +1000,6 @@ mod tests {
         )));
     }
 
-    #[cfg(windows)]
-    fn shell_snippet(script: &str) -> String {
-        script.replace('\'', "\"")
-    }
-
-    #[cfg(not(windows))]
     fn shell_snippet(script: &str) -> String {
         script.to_string()
     }

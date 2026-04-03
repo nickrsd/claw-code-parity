@@ -1050,7 +1050,6 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::io::ErrorKind;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1082,6 +1081,58 @@ mod tests {
         std::env::temp_dir().join(format!("runtime-mcp-stdio-{nanos}-{unique_id}"))
     }
 
+    #[cfg(unix)]
+    fn mark_executable(script_path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(script_path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(script_path, permissions).expect("chmod");
+    }
+
+    #[cfg(not(unix))]
+    fn mark_executable(_: &Path) {}
+
+    fn python_command() -> String {
+        std::env::var("PYTHON")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(find_python_on_path)
+            .unwrap_or_else(|| {
+                if cfg!(windows) {
+                    "python".to_string()
+                } else {
+                    "python3".to_string()
+                }
+            })
+    }
+
+    fn find_python_on_path() -> Option<String> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .flat_map(|dir| candidate_python_paths(&dir))
+            .find(|candidate| {
+                candidate.is_file()
+                    && !candidate
+                        .to_string_lossy()
+                        .contains("WindowsApps")
+            })
+            .map(|candidate| candidate.to_string_lossy().into_owned())
+    }
+
+    fn candidate_python_paths(dir: &Path) -> Vec<PathBuf> {
+        if cfg!(windows) {
+            vec![
+                dir.join("python3.exe"),
+                dir.join("python.exe"),
+                dir.join("py.exe"),
+            ]
+        } else {
+            vec![dir.join("python3"), dir.join("python")]
+        }
+    }
+
+    #[cfg(unix)]
     fn write_echo_script() -> PathBuf {
         let root = temp_dir();
         fs::create_dir_all(&root).expect("temp dir");
@@ -1091,9 +1142,7 @@ mod tests {
             "#!/bin/sh\nprintf 'READY:%s\\n' \"$MCP_TEST_TOKEN\"\nIFS= read -r line\nprintf 'ECHO:%s\\n' \"$line\"\n",
         )
         .expect("write script");
-        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).expect("chmod");
+        mark_executable(&script_path);
         script_path
     }
 
@@ -1137,9 +1186,7 @@ mod tests {
         ]
         .join("\n");
         fs::write(&script_path, script).expect("write script");
-        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).expect("chmod");
+        mark_executable(&script_path);
         script_path
     }
 
@@ -1271,9 +1318,7 @@ mod tests {
         ]
         .join("\n");
         fs::write(&script_path, script).expect("write script");
-        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).expect("chmod");
+        mark_executable(&script_path);
         script_path
     }
 
@@ -1396,12 +1441,11 @@ mod tests {
         ]
         .join("\n");
         fs::write(&script_path, script).expect("write script");
-        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).expect("chmod");
+        mark_executable(&script_path);
         script_path
     }
 
+    #[cfg(unix)]
     fn sample_bootstrap(script_path: &Path) -> McpClientBootstrap {
         let config = ScopedMcpServerConfig {
             scope: ConfigSource::Local,
@@ -1424,7 +1468,7 @@ mod tests {
         env: BTreeMap<String, String>,
     ) -> crate::mcp_client::McpStdioTransport {
         crate::mcp_client::McpStdioTransport {
-            command: "python3".to_string(),
+            command: python_command(),
             args: vec![script_path.to_string_lossy().into_owned()],
             env,
             tool_call_timeout_ms: None,
@@ -1473,7 +1517,7 @@ mod tests {
         ScopedMcpServerConfig {
             scope: ConfigSource::Local,
             config: McpServerConfig::Stdio(McpStdioServerConfig {
-                command: "python3".to_string(),
+                command: python_command(),
                 args: vec![script_path.to_string_lossy().into_owned()],
                 env,
                 tool_call_timeout_ms: None,
@@ -1481,6 +1525,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn spawns_stdio_process_and_round_trips_io() {
         let runtime = Builder::new_current_thread()
@@ -1683,6 +1728,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn direct_spawn_uses_transport_env() {
         let runtime = Builder::new_current_thread()
@@ -1951,7 +1997,7 @@ mod tests {
                 ScopedMcpServerConfig {
                     scope: ConfigSource::Local,
                     config: McpServerConfig::Stdio(McpStdioServerConfig {
-                        command: "python3".to_string(),
+                        command: python_command(),
                         args: vec![script_path.to_string_lossy().into_owned()],
                         env: BTreeMap::from([(
                             "MCP_TOOL_CALL_DELAY_MS".to_string(),
@@ -2004,7 +2050,7 @@ mod tests {
                 ScopedMcpServerConfig {
                     scope: ConfigSource::Local,
                     config: McpServerConfig::Stdio(McpStdioServerConfig {
-                        command: "python3".to_string(),
+                        command: python_command(),
                         args: vec![script_path.to_string_lossy().into_owned()],
                         env: BTreeMap::from([(
                             "MCP_INVALID_TOOL_CALL_RESPONSE".to_string(),
